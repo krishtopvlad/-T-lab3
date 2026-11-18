@@ -1,0 +1,17 @@
+﻿Implementation,Workers,Time_sec,Hashes_per_sec,Speedup,Efficiency_percent
+Baseline,1,36.923,2579211,1.0,100.0
+Baseline,2,21.443,4441179,1.72,86.1
+Baseline,4,14.442,6594003,2.56,63.9
+Baseline,6,11.252,8463178,3.28,54.7
+Baseline,8,9.597,9923259,3.85,48.1
+Baseline,10,8.27,11514471,4.46,44.6
+Baseline,12,8.466,11248881,4.36,36.3
+Baseline,16,8.879,10725027,4.16,26.0
+Cooperative,1,5.721,16645993,1.0,100.0
+Cooperative,2,2.966,32104947,1.93,96.4
+Cooperative,4,1.487,64056805,3.85,96.2
+Cooperative,6,1.194,79786064,4.79,79.9
+Cooperative,8,1.075,88654464,5.32,66.5
+Cooperative,10,0.939,101421840,6.09,60.9
+Cooperative,12,0.887,107549712,6.45,53.7
+Cooperative,16,0.882,108089374,6.49,40.5
