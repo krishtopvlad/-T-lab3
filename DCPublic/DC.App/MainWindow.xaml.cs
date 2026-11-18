@@ -18,6 +18,7 @@ public partial class MainWindow : Window
     [
         ("Baseline", new PowSolver()),
         ("Hybrid Optimized", new HybridPowSolver()),
+        ("Cooperative", new CooperativePowSolver()),
     ];
     private readonly TaskRow[] _rows = Enumerable.Range(0, TaskCount).Select(id => new TaskRow(id)).ToArray();
     private readonly Stopwatch _liveElapsed = new();
