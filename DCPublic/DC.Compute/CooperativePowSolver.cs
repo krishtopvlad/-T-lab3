@@ -13,49 +13,46 @@ using System.Text;
 
 namespace DC.Compute;
 
-/// <summary>
-/// Улучшенный решатель:
-///  1. выделенные потоки (LongRunning) вместо блокировки потоков ThreadPool;
-///  2. кооперативный поиск: нонс-пространство задачи делится на чанки, которые разбирают
-///     все свободные воркеры. Когда очередь задач кончилась, воркеры не простаивают,
-///     а помогают добивать «длинные» задачи — это убирает хвост;
-///  3. два ядра хеширования; при старте программы замеряется, какое быстрее на этом процессоре:
-///     - Avx2: SHA-256 сразу для 8 nonce в векторных регистрах (Vector256), сообщение всегда &lt; 56 байт,
-///       т.е. ровно один блок; проверяется только первое слово хеша (сложность не больше 24 бит);
-///     - HashData: встроенный SHA256.HashData (использует аппаратный SHA процессора/ОС), но nonce
-///       инкрементируется прямо в буфере, без форматирования на каждый хеш.
-/// </summary>
 public sealed class CooperativePowSolver : IPowSolver
 {
-    private const int ChunkSize = 10_000; // чанк c покрывает nonce [c*10000, (c+1)*10000)
+    // Размер одного диапазона nonce, который получает воркер.
+    private const int ChunkSize = 10_000;
 
     private sealed class Puzzle
     {
         public byte[] Prefix = [];
+
         public long NextChunk = -1;
-        public int State;    // 0 — ищем, 1 — решена
-        public int Started;  // 0/1 — отправлен ли PowProgress о начале
-        public int Active;   // сколько воркеров сейчас работает над задачей
+
+        public int State;
+
+        public int Started;
+
+        public int Active;
     }
 
     private sealed class Run
     {
         public readonly Puzzle[] Puzzles = new Puzzle[PowSolver.TaskCount];
+
         public readonly PowSolution[] Solutions = new PowSolution[PowSolver.TaskCount];
+
         public int NextTask = -1;
+
         public int Completed;
+
         public long TotalAttempts;
+
         public bool UseAvx2;
     }
 
     public enum KernelMode { Auto, HashData, Avx2 }
 
-    /// <summary>Для тестов: принудительный выбор ядра. По умолчанию Auto — выбирается по замеру.</summary>
     public static KernelMode Mode { get; set; } = KernelMode.Auto;
 
-    /// <summary>Какое ядро выбрал автоподбор.</summary>
     public static string AutoKernelName => UseAvx2Auto ? "Avx2" : "HashData";
 
+    // Подготавливает задачи, запускает воркеры и собирает результаты.
     public async Task<PowResult> SolveAsync(string seed, int difficultyBits, int workerCount,
         IProgress<PowProgress>? progress, CancellationToken cancellationToken, PowTelemetry? telemetry = null)
     {
@@ -93,7 +90,7 @@ public sealed class CooperativePowSolver : IPowSolver
                 Task.Factory.StartNew(() =>
                 {
                     try { WorkerLoop(workerId, difficultyBits, run, progress, token, telemetry); }
-                    catch { linked.Cancel(); throw; } // ошибка одного воркера останавливает остальных
+                    catch { linked.Cancel(); throw; }
                 }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray();
 
             try { await Task.WhenAll(workers).ConfigureAwait(false); }
@@ -117,17 +114,17 @@ public sealed class CooperativePowSolver : IPowSolver
         finally
         {
             elapsed.Stop();
-            // Не возвращаемся, пока все воркеры не завершились (в т.ч. при отмене/ошибке).
             linked.Cancel();
             try { await Task.WhenAll(workers).ConfigureAwait(false); } catch { /* уже обработано выше */ }
             telemetry?.Finish();
         }
     }
 
+    // Сначала воркер берёт отдельные задачи, затем помогает завершать оставшиеся.
     private static void WorkerLoop(int workerId, int bits, Run run,
         IProgress<PowProgress>? progress, CancellationToken ct, PowTelemetry? telemetry)
     {
-        // Фаза 1: берём новые задачи из общей очереди.
+        // Этап 1: получаем новые задачи из общей очереди.
         while (true)
         {
             ct.ThrowIfCancellationRequested();
@@ -136,8 +133,7 @@ public sealed class CooperativePowSolver : IPowSolver
             Work(id, workerId, bits, run, progress, ct, telemetry);
         }
 
-        // Фаза 2: новых задач нет — помогаем решать те, что ещё не решены.
-        // Поиск «без памяти» (геометрическое распределение), поэтому помощь на любом этапе так же полезна.
+        // Этап 2: когда новых задач нет, подключаемся к ещё не решённым.
         var spin = new SpinWait();
         while (Volatile.Read(ref run.Completed) < PowSolver.TaskCount)
         {
@@ -156,6 +152,7 @@ public sealed class CooperativePowSolver : IPowSolver
         }
     }
 
+    // Обрабатывает одну задачу: получает чанки и прекращает поиск после нахождения nonce.
     private static void Work(int id, int workerId, int bits, Run run,
         IProgress<PowProgress>? progress, CancellationToken ct, PowTelemetry? telemetry)
     {
@@ -171,12 +168,12 @@ public sealed class CooperativePowSolver : IPowSolver
             while (Volatile.Read(ref puzzle.State) == 0)
             {
                 ct.ThrowIfCancellationRequested();
+                // Каждый воркер атомарно получает следующий, ещё не проверенный чанк.
                 long chunk = Interlocked.Increment(ref puzzle.NextChunk);
                 bool found = run.UseAvx2 && chunk >= 1
                     ? SearchChunkAvx2(puzzle.Prefix, chunk, bits, out ulong nonce, out int tried)
                     : SearchChunkHashData(puzzle.Prefix, checked((ulong)chunk * ChunkSize), bits, out nonce, out tried);
 
-                // Счётчики обновляем порциями (раз на чанк), а не на каждый хеш.
                 Interlocked.Add(ref run.TotalAttempts, tried);
                 telemetry?.AddAttempts(lane, id, tried);
 
@@ -198,9 +195,8 @@ public sealed class CooperativePowSolver : IPowSolver
         }
     }
 
-    // ---------- горячий цикл ----------
 
-    // Таблица: для d = 0..9999 четыре десятичные цифры (с ведущими нулями) в одном слове, big-endian.
+    // Таблица ускоряет подготовку четырёх последних цифр nonce для AVX2.
     private static readonly uint[] DigitTable = BuildDigitTable();
 
     private static uint[] BuildDigitTable()
@@ -224,7 +220,7 @@ public sealed class CooperativePowSolver : IPowSolver
     ];
     
 
-    // Выбор ядра: один раз при загрузке типа (т.е. при старте приложения), вне замеров решателя.
+    // При первом запуске сравнивает скорость двух ядер и запоминает более быстрое.
     private static readonly bool UseAvx2Auto = Avx2.IsSupported && Vector256.IsHardwareAccelerated && AutotuneAvx2();
 
     private static bool AutotuneAvx2()
@@ -232,7 +228,7 @@ public sealed class CooperativePowSolver : IPowSolver
         try
         {
             byte[] prefix = Encoding.UTF8.GetBytes("BSU-POW-1|000000|99|");
-            const int bits32 = 32; // 32 нулевых бита — «решение» практически не найдётся, меряем чистую скорость
+            const int bits32 = 32;
             double Best(bool avx)
             {
                 double best = double.MaxValue;
@@ -248,14 +244,14 @@ public sealed class CooperativePowSolver : IPowSolver
                 }
                 return best;
             }
-            Best(true); Best(false); // прогрев JIT
+            Best(true); Best(false);
             return Best(true) <= Best(false);
         }
         catch { return false; }
     }
 
-    /// <summary>Ядро на встроенном SHA256.HashData. Перебирает nonce в [start, start+ChunkSize).</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    // Стандартное ядро: проверяет один nonce за раз через SHA256.HashData.
     private static bool SearchChunkHashData(byte[] prefix, ulong start, int bits, out ulong nonce, out int tried)
     {
         int prefixLen = prefix.Length;
@@ -275,7 +271,6 @@ public sealed class CooperativePowSolver : IPowSolver
                 tried = n + 1;
                 return true;
             }
-            // Инкремент десятичной записи nonce прямо в буфере.
             current++;
             int pos = len - 1;
             while (pos >= prefixLen && msg[pos] == (byte)'9') { msg[pos] = (byte)'0'; pos--; }
@@ -296,19 +291,15 @@ public sealed class CooperativePowSolver : IPowSolver
     private static Vector256<uint> Rotr(Vector256<uint> x, [ConstantExpected] byte n) =>
         Vector256.ShiftRightLogical(x, n) | Vector256.ShiftLeft(x, 32 - n);
 
-    /// <summary>
-    /// Ядро на AVX2: чанк c ≥ 1 = все nonce вида «десятичная запись c» + «4 цифры 0000..9999».
-    /// Всё, кроме последних 4 цифр, одинаково, поэтому SHA-256 считается сразу для 8 соседних nonce
-    /// (по одному в каждой полосе Vector256), а меняющиеся слова сообщения берутся из таблицы цифр.
-    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    // AVX2-ядро: проверяет восемь nonce одновременно с помощью SIMD.
     private static bool SearchChunkAvx2(byte[] prefix, long chunk, int bits, out ulong nonce, out int tried)
     {
         Span<byte> block = stackalloc byte[64];
         prefix.CopyTo(block);
         Utf8Formatter.TryFormat((ulong)chunk, block[prefix.Length..], out int stemDigits);
-        int p = prefix.Length + stemDigits;      // позиция первой из 4 последних цифр
-        int totalLen = p + 4;                    // ≤ 44 < 56, значит один блок SHA-256
+        int p = prefix.Length + stemDigits;
+        int totalLen = p + 4;
         block[totalLen] = 0x80;
 
         Span<Vector256<uint>> w = stackalloc Vector256<uint>[64];
@@ -318,8 +309,8 @@ public sealed class CooperativePowSolver : IPowSolver
         c[15] = (uint)(totalLen * 8);
         for (int i = 0; i < 16; i++) w[i] = Vector256.Create(c[i]);
 
-        int ia = p >> 2;           // слово, в котором начинаются 4 цифры
-        int a = p & 3;             // смещение первой цифры внутри слова (0..3)
+        int ia = p >> 2;
+        int a = p & 3;
         byte shr = (byte)(8 * a), shl = (byte)(32 - 8 * a);
         uint cA = c[ia], cB = c[ia + 1];
         ref uint table = ref MemoryMarshal.GetArrayDataReference(DigitTable);
@@ -333,6 +324,7 @@ public sealed class CooperativePowSolver : IPowSolver
             w[ia] = Vector256.Create(cA) | Vector256.ShiftRightLogical(packed, shr);
             if (a != 0) w[ia + 1] = Vector256.Create(cB) | Vector256.ShiftLeft(packed, shl);
 
+            // Подготовка расписания SHA-256 для восьми nonce сразу.
             for (int t = 16; t < 64; t++)
             {
                 Vector256<uint> x = w[t - 15], y = w[t - 2];
@@ -345,6 +337,7 @@ public sealed class CooperativePowSolver : IPowSolver
                 vc = Vector256.Create(0x3c6ef372u), vd = Vector256.Create(0xa54ff53au),
                 ve = Vector256.Create(0x510e527fu), vf = Vector256.Create(0x9b05688cu),
                 vg = Vector256.Create(0x1f83d9abu), vh = Vector256.Create(0x5be0cd19u);
+            // 64 раунда сжатия SHA-256 выполняются векторно.
             for (int t = 0; t < 64; t++)
             {
                 Vector256<uint> S1 = Rotr(ve, 6) ^ Rotr(ve, 11) ^ Rotr(ve, 25);
@@ -355,12 +348,12 @@ public sealed class CooperativePowSolver : IPowSolver
                 vh = vg; vg = vf; vf = ve; ve = vd + t1; vd = vc; vc = vb; vb = va; va = t1 + S0 + maj;
             }
 
-            // Первое слово хеша каждой полосы; ведущие нули (≤ 24 бит) целиком лежат в нём.
+            // Проверяем ведущие нулевые биты по первому 32-битному слову хеша.
             uint mask = Vector256.Equals(Vector256.ShiftRightLogical(va + iv0, shift), Vector256<uint>.Zero)
                 .ExtractMostSignificantBits();
             if (mask != 0)
             {
-                int dd = d + BitOperations.TrailingZeroCount(mask); // самая младшая полоса = минимальный nonce
+                int dd = d + BitOperations.TrailingZeroCount(mask);
                 nonce = (ulong)chunk * ChunkSize + (ulong)dd;
                 tried = dd + 1;
                 return true;
